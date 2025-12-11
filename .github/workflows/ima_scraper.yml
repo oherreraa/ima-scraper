@@ -1,15 +1,18 @@
 name: IMA 8UIT Scraper
 
 on:
-  workflow_dispatch:        # ejecución manual
+  # Ejecución manual desde la pestaña "Actions"
+  workflow_dispatch:
+
+  # (Opcional) ejecución automática diaria
   schedule:
-    - cron: "0 11 * * *"    # todos los días 11:00 UTC (~06:00 Lima/Bogotá)
+    - cron: "0 11 * * *"    # 11:00 UTC ≈ 06:00 Lima/Bogotá
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
-    # Permite que github-actions[bot] haga git push
+    # Necesario para que github-actions[bot] pueda hacer git push
     permissions:
       contents: write
 
@@ -41,7 +44,7 @@ jobs:
 
       # -----------------------------
       # 4) Instalar dependencias Python
-      #    (no usamos Playwright aquí)
+      #    (simple: requests + bs4 + OCR PDF)
       # -----------------------------
       - name: Install Python dependencies
         run: |
@@ -55,7 +58,7 @@ jobs:
             pdf2image
 
       # -----------------------------
-      # 5) Ejecutar el scraper del IMA
+      # 5) Ejecutar el scraper IMA
       # -----------------------------
       - name: Run IMA 8UIT scraper
         run: |
@@ -71,7 +74,7 @@ jobs:
           file_pattern: data/convocatorias_vigentes.json
 
       # -----------------------------
-      # 7) (Opcional) Subir JSON como artifact
+      # 7) (Opcional) subir JSON como artifact
       # -----------------------------
       - name: Upload processed JSON
         uses: actions/upload-artifact@v4
