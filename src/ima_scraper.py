@@ -8,10 +8,9 @@ Objetivo:
     https://www.ima.org.pe/adquisiciones-bienes-servicios-v2/s---1.html
     https://www.ima.org.pe/adquisiciones-bienes-servicios-v2/s---2.html
     ...
-  hasta que ya no existan convocatorias.
 
 - De cada convocatoria:
-    · numero_convocatoria (ej. 'SOLICITUD DE COTIZACION N° 4017-2025')
+    · numero_convocatoria (texto completo, ej. 'SOLICITUD DE COTIZACION N° 4017-2025')
     · numero (ej. '4017-2025')
     · descripcion
     · publicado_el (dd/mm/yyyy)
@@ -44,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image  # noqa: F401 (no se usa directamente, pero útil para tipos)
 import pytesseract
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
@@ -120,7 +119,7 @@ def _extract_caracteristicas_block(full_text: str) -> Optional[str]:
 
     segment = full_text[start_idx:end_idx].strip()
 
-    # Cortamos muy largos para evitar JSON monstruoso
+    # Cortamos muy largos para evitar JSON gigantes
     max_len = 4000
     if len(segment) > max_len:
         segment = segment[:max_len] + "\n[...]"
@@ -149,7 +148,7 @@ def extract_caracteristicas_from_pdf(
     try:
         reader = PdfReader(pdf_path)
     except Exception as e:
-        logging.warning(f"No se pudo abrir PDF '{pdf_path}': {e}")
+        logging.warning("No se pudo abrir PDF '%s': %s", pdf_path, e)
         return None, False
 
     for page in reader.pages:
@@ -218,6 +217,7 @@ def download_pdf(session: requests.Session, url: str, dest_dir: Path) -> Optiona
     Devuelve la ruta local o None si falla.
     """
     try:
+        logging.info("Descargando PDF: %s", url)
         resp = session.get(url, timeout=60)
         if resp.status_code == 404:
             logging.warning("PDF 404: %s", url)
@@ -247,8 +247,7 @@ def download_pdf(session: requests.Session, url: str, dest_dir: Path) -> Optiona
 
 def parse_fecha_hora_estado(text: str) -> Tuple[str, str, str]:
     """
-    A partir del texto completo del "card" de la convocatoria
-    extrae:
+    A partir de un texto que contenga fecha, hora y estado, extrae:
       - fecha_limite (dd/mm/yyyy)
       - hora_limite (hh:mm AM/PM)
       - estado (entre paréntesis, ej. VIGENTE / VENCIDO)
@@ -267,47 +266,6 @@ def parse_fecha_hora_estado(text: str) -> Tuple[str, str, str]:
     hora = m_hora.group(1).upper() if m_hora else ""
 
     return fecha, hora, estado
-
-
-def parse_descripcion_block(desc_text: str) -> Tuple[str, str, str]:
-    """
-    A partir del texto de la "card" que contiene:
-
-      'SOLICITUD DE COTIZACION N° 4017-2025
-       SERVICIO DE ...
-       | Publicado el 10/12/2025 | ...'
-
-    Devuelve:
-      - numero -> '4017-2025'
-      - descripcion -> 'SERVICIO DE ...'
-      - publicado_el -> '10/12/2025'
-    """
-    txt = " ".join(desc_text.split())
-
-    m_num = re.search(
-        r"SOLICITUD\s+DE\s+COTIZACION\s*N[°º]\s*([0-9\-]+)",
-        txt,
-        flags=re.IGNORECASE,
-    )
-    numero = m_num.group(1).strip() if m_num else ""
-
-    m_pub = re.search(
-        r"PUBLICADO\s+EL\s+([0-9]{2}/[0-9]{2}/[0-9]{4})",
-        txt,
-        flags=re.IGNORECASE,
-    )
-    publicado_el = m_pub.group(1) if m_pub else ""
-
-    desc_region = txt
-    if m_num:
-        desc_region = desc_region[m_num.end():].strip()
-    if m_pub:
-        desc_region = desc_region[:m_pub.start()].strip()
-
-    desc_region = desc_region.replace("|", " ").strip()
-    descripcion = " ".join(desc_region.split())
-
-    return numero, descripcion, publicado_el
 
 
 def build_page_url(page: int) -> str:
@@ -335,61 +293,160 @@ def parse_page_convocatorias(
     page_number: int,
 ) -> List[Dict]:
     """
-    Parsea una página HTML del IMA y devuelve las convocatorias VIGENTES
-    ya enriquecidas con información del PDF (si existe).
+    Parsea una página HTML del IMA y devuelve las convocatorias VIGENTES,
+    enriquecidas con la info del PDF (si existe).
+
+    Estrategia:
+      - Tomar el texto entre "CONVOCATORIAS VIGENTES" y "Anterior".
+      - Trabajar línea por línea.
+      - Cada bloque comienza con "SOLICITUD DE COTIZACION N°".
+      - Dentro del bloque se detectan:
+          · descripción
+          · publicado_el
+          · tipo (BIENES / SERVICIO)
+          · fecha límite
+          · hora límite
+          · estado (VIGENTE / VENCIDO)
+      - Se filtran solo las que tienen estado VIGENTE.
+      - Los enlaces PDF se obtienen de los <a href="convmc_v2-files/...pdf">,
+        en el mismo orden que las convocatorias de la página.
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Buscar nodos que contengan "SOLICITUD DE COTIZACION N°"
-    pattern = re.compile(r"SOLICITUD\s+DE\s+COTIZACION\s*N[°º]\s*\d", re.IGNORECASE)
-    text_nodes = soup.find_all(string=pattern)
+    # ---------- 1) Segmento de texto útil ----------
+    full_text = soup.get_text("\n", strip=True)
+
+    if "CONVOCATORIAS VIGENTES" not in full_text:
+        logging.info(
+            "No se encontró 'CONVOCATORIAS VIGENTES' en la página %s", page_number
+        )
+        return []
+
+    start_idx = full_text.index("CONVOCATORIAS VIGENTES")
+    end_idx = full_text.find("Anterior", start_idx)
+    if end_idx == -1:
+        end_idx = len(full_text)
+
+    segment = full_text[start_idx:end_idx]
+    lines_raw = segment.split("\n")
+    lines = [l.strip() for l in lines_raw if l.strip()]
+
+    # Frases fijas que queremos eliminar
+    header_phrases = {
+        "CONVOCATORIAS VIGENTES",
+        "PROVEEDORES CON BUENA PRO",
+        "TIPO COTIZACION BUSCAR",
+        "[ SELECCIONE ]  BIENES SERVICIO",
+        "DESCRIPCION  TIPO PLAZO DESCARGAR",
+        "DESCRIPCIÓN  TIPO PLAZO DESCARGAR",
+    }
+    header_upper = {h.upper() for h in header_phrases}
+    cleaned_lines: List[str] = [
+        l for l in lines if l.upper() not in header_upper
+    ]
+
+    # ---------- 2) Identificar bloques por SOLICITUD DE COTIZACION N° ----------
+    indices = [
+        i for i, l in enumerate(cleaned_lines)
+        if "SOLICITUD DE COTIZACION N°" in l.upper()
+    ]
+
+    if not indices:
+        logging.info(
+            "Página %s: no se encontraron 'SOLICITUD DE COTIZACION N°'",
+            page_number,
+        )
+        return []
+
+    # ---------- 3) Extraer PDFs en orden ----------
+    pdf_links = [
+        urljoin(BASE_URL + "/", a["href"])
+        for a in soup.select('a[href*="convmc_v2-files"][href$=".pdf"]')
+        if a.get("href")
+    ]
+    # fallback más genérico por si cambian estructura
+    if not pdf_links:
+        pdf_links = [
+            urljoin(BASE_URL + "/", a["href"])
+            for a in soup.select('a[href$=".pdf"]')
+            if a.get("href")
+        ]
 
     results: List[Dict] = []
-    seen_containers = set()
 
-    for node in text_nodes:
-        container = node.parent
+    # ---------- 4) Procesar cada bloque de convocatoria ----------
+    for idx_pos, start in enumerate(indices):
+        end = indices[idx_pos + 1] if idx_pos + 1 < len(indices) else len(cleaned_lines)
+        chunk = cleaned_lines[start:end]
 
-        # Subimos algunos niveles hasta encontrar un contenedor razonable
-        # que tenga "Publicado el" y (idealmente) el link al PDF.
-        for _ in range(6):
-            if container is None:
-                break
-            text = container.get_text(" ", strip=True)
-            if "Publicado el" in text:
-                break
-            container = container.parent
-
-        if container is None:
+        if not chunk:
             continue
 
-        # Evitar usar el mismo contenedor varias veces
-        key = id(container)
-        if key in seen_containers:
-            continue
-        seen_containers.add(key)
+        solicitud_line = chunk[0]
+        # numero: 4017-2025
+        m_num = re.search(r"N[°º]\s*([0-9\-]+)", solicitud_line, flags=re.IGNORECASE)
+        numero = m_num.group(1).strip() if m_num else ""
 
-        full_text = container.get_text(" ", strip=True)
-        numero, descripcion, publicado_el = parse_descripcion_block(full_text)
-        fecha_limite, hora_limite, estado = parse_fecha_hora_estado(full_text)
+        numero_convocatoria = solicitud_line.strip()
+
+        descripcion = ""
+        publicado_el = ""
+        tipo = ""
+        fecha_limite = ""
+        hora_limite = ""
+        estado = ""
+
+        for l in chunk[1:]:
+            up = l.upper()
+
+            # Publicado el XX/XX/XXXX
+            if "PUBLICADO EL" in up and not publicado_el:
+                m_pub = re.search(r"(\d{2}/\d{2}/\d{4})", l)
+                if m_pub:
+                    publicado_el = m_pub.group(1)
+                continue
+
+            # Tipo: BIENES / SERVICIO
+            if up in ("BIENES", "SERVICIO"):
+                if not tipo:
+                    tipo = up
+                continue
+
+            # Fecha límite
+            if not fecha_limite:
+                m_f = re.search(r"(\d{2}/\d{2}/\d{4})", l)
+                if m_f:
+                    fecha_limite = m_f.group(1)
+                    continue
+
+            # Hora límite
+            if not hora_limite:
+                m_h = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)", up)
+                if m_h:
+                    hora_limite = m_h.group(1).upper()
+                    continue
+
+            # Estado (VIGENTE / VENCIDO)
+            if "(" in up and ")" in up and not estado:
+                estado = re.sub(r"[()]", "", up).strip()
+                continue
+
+            # Descripción (primer texto que no sea cabecera ni "Publicado el")
+            if not descripcion:
+                if "PUBLICADO EL" in up:
+                    continue
+                if "DESCRIPCION" in up or "DESCRIPCIÓN" in up:
+                    continue
+                if "TIPO PLAZO DESCARGAR" in up:
+                    continue
+                descripcion = l.strip()
 
         # Solo convocatorias VIGENTES
         if estado != "VIGENTE":
             continue
 
-        m_tipo = re.search(r"\b(BIENES|SERVICIO)\b", full_text, flags=re.IGNORECASE)
-        tipo = m_tipo.group(1).upper() if m_tipo else ""
-
-        # Link al PDF dentro del contenedor
-        pdf_url = None
-        link = container.find("a", href=re.compile(r"\.pdf\b", re.IGNORECASE))
-        if link and link.get("href"):
-            pdf_url = urljoin(BASE_URL + "/", link["href"])
-
         item: Dict[str, Optional[str]] = {
-            "numero_convocatoria": (
-                f"SOLICITUD DE COTIZACION N° {numero}" if numero else ""
-            ),
+            "numero_convocatoria": numero_convocatoria,
             "numero": numero,
             "descripcion": descripcion,
             "publicado_el": publicado_el,
@@ -398,24 +455,27 @@ def parse_page_convocatorias(
             "hora_limite": hora_limite,
             "estado": estado,
             "pagina_origen": page_number,
-            "tdr_url": pdf_url,
+            "tdr_url": None,
             "tdr_filename": None,
             "tdr_downloaded": False,
             "caracteristicas_tecnicas": None,
             "caracteristicas_tecnicas_ocr": False,
         }
 
-        # Descargar PDF y extraer CARACTERISTICAS TECNICAS
-        if pdf_url:
-            pdf_path = download_pdf(session, pdf_url, PDF_DIR)
+        results.append(item)
+
+    # ---------- 5) Asignar PDFs a las convocatorias en orden ----------
+    for i, item in enumerate(results):
+        if i < len(pdf_links):
+            item["tdr_url"] = pdf_links[i]
+
+            pdf_path = download_pdf(session, item["tdr_url"], PDF_DIR)
             if pdf_path:
                 item["tdr_filename"] = pdf_path.name
                 item["tdr_downloaded"] = True
                 block, used_ocr = extract_caracteristicas_from_pdf(str(pdf_path), True)
                 item["caracteristicas_tecnicas"] = block
                 item["caracteristicas_tecnicas_ocr"] = bool(used_ocr)
-
-        results.append(item)
 
     logging.info(
         "Página %s: convocatorias VIGENTES encontradas: %s",
