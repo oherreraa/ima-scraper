@@ -35,7 +35,6 @@ Objetivo:
 
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +42,6 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image  # noqa: F401 (no se usa directamente, pero útil para tipos)
 import pytesseract
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
@@ -245,29 +243,6 @@ def download_pdf(session: requests.Session, url: str, dest_dir: Path) -> Optiona
 # BLOQUE 3: Utilidades de parsing de HTML
 # ============================================================
 
-def parse_fecha_hora_estado(text: str) -> Tuple[str, str, str]:
-    """
-    A partir de un texto que contenga fecha, hora y estado, extrae:
-      - fecha_limite (dd/mm/yyyy)
-      - hora_limite (hh:mm AM/PM)
-      - estado (entre paréntesis, ej. VIGENTE / VENCIDO)
-    """
-    plazo_clean = " ".join(text.split())
-
-    m_estado = re.search(r"\(([^()]*)\)\s*$", plazo_clean)
-    estado = m_estado.group(1).strip().upper() if m_estado else ""
-
-    m_fecha = re.search(r"(\d{2}/\d{2}/\d{4})", plazo_clean)
-    fecha = m_fecha.group(1) if m_fecha else ""
-
-    m_hora = re.search(
-        r"(\d{1,2}:\d{2}\s*[AP]M)", plazo_clean, flags=re.IGNORECASE
-    )
-    hora = m_hora.group(1).upper() if m_hora else ""
-
-    return fecha, hora, estado
-
-
 def build_page_url(page: int) -> str:
     return f"{BASE_URL}/s---{page}.html"
 
@@ -426,9 +401,12 @@ def parse_page_convocatorias(
                     hora_limite = m_h.group(1).upper()
                     continue
 
-            # Estado (VIGENTE / VENCIDO)
-            if "(" in up and ")" in up and not estado:
-                estado = re.sub(r"[()]", "", up).strip()
+            # Estado (VIGENTE / VENCIDO) — corregido para tomar SOLO el texto
+            # dentro de paréntesis, ignorando lo que viene después.
+            if not estado and "(" in up and ")" in up:
+                m_state = re.search(r"\(([^()]+)\)", up)
+                if m_state:
+                    estado = m_state.group(1).strip().upper()
                 continue
 
             # Descripción (primer texto que no sea cabecera ni "Publicado el")
