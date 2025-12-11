@@ -3,25 +3,41 @@ name: IMA 8UIT Scraper
 on:
   # Ejecución manual desde la pestaña "Actions"
   workflow_dispatch:
-
+    inputs:
+      debug_mode:
+        description: 'Habilitar modo debug (guarda HTMLs)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  
+  # Disparado desde n8n u otros sistemas externos
+  repository_dispatch:
+    types: [scrape_ima]
+  
   # (Opcional) ejecución automática diaria
   schedule:
-    - cron: "0 11 * * *"    # 11:00 UTC ≈ 06:00 Lima/Bogotá
+    - cron: "0 11 * * *"    # 11:00 UTC ≈ 06:00 Lima/Cusco
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
+    
     # Necesario para que github-actions[bot] pueda hacer git push
     permissions:
       contents: write
-
+      actions: write
+    
     steps:
       # -----------------------------
       # 1) Checkout del repositorio
       # -----------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       # -----------------------------
       # 2) Instalar dependencias de sistema
@@ -32,7 +48,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             tesseract-ocr \
-            poppler-utils
+            tesseract-ocr-spa \
+            poppler-utils \
+            libgl1-mesa-glx \
+            libglib2.0-0
+          
+          # Verificar instalación
+          tesseract --version
+          pdftoppm -v
 
       # -----------------------------
       # 3) Setup de Python
@@ -41,43 +64,155 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       # -----------------------------
       # 4) Instalar dependencias Python
-      #    (simple: requests + bs4 + OCR PDF)
       # -----------------------------
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            requests \
-            beautifulsoup4 \
-            pillow \
-            pytesseract \
-            PyPDF2 \
-            pdf2image
+          pip install -r requirements.txt
 
       # -----------------------------
-      # 5) Ejecutar el scraper IMA
+      # 5) Crear directorios necesarios
+      # -----------------------------
+      - name: Create required directories
+        run: |
+          mkdir -p data/pdfs_ima
+          mkdir -p data/logs
+          chmod 755 data/
+
+      # -----------------------------
+      # 6) Ejecutar el scraper IMA
       # -----------------------------
       - name: Run IMA 8UIT scraper
+        env:
+          IMA_DEBUG_MODE: ${{ github.event.inputs.debug_mode || 'false' }}
         run: |
+          echo "Iniciando scraper IMA..."
+          echo "Debug mode: $IMA_DEBUG_MODE"
+          echo "Triggered by: ${{ github.event_name }}"
+          
+          # Ejecutar scraper
           python src/ima_scraper.py
+          
+          # Mostrar estadísticas
+          if [ -f "data/convocatorias_vigentes.json" ]; then
+            echo "✅ Scraping completado exitosamente"
+            echo "📊 Estadísticas:"
+            python -c "
+import json
+with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(f\"  - Total convocatorias vigentes: {data['metadata']['total_convocatorias_vigentes']}\")
+print(f\"  - Scrapeado en: {data['metadata']['scraped_at_utc']}\")
+            "
+          else
+            echo "❌ Error: No se generó el archivo JSON"
+            exit 1
+          fi
 
       # -----------------------------
-      # 6) Commit + push del JSON
+      # 7) Limpiar archivos temporales (excepto JSON)
+      # -----------------------------
+      - name: Cleanup temporary files
+        run: |
+          # Limpiar PDFs temporales (muy grandes para Git)
+          if [ -d "data/pdfs_ima" ]; then
+            rm -rf data/pdfs_ima/*.pdf || true
+          fi
+          
+          # Limpiar HTMLs de debug (solo en modo normal)
+          if [ "$IMA_DEBUG_MODE" != "true" ]; then
+            rm -f data/debug_page_*.html || true
+          fi
+          
+          echo "🧹 Archivos temporales limpiados"
+
+      # -----------------------------
+      # 8) Commit + push del JSON
       # -----------------------------
       - name: Commit JSON actualizado
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: actualizar convocatorias vigentes IMA"
-          file_pattern: data/convocatorias_vigentes.json
+          commit_message: "chore: actualizar convocatorias vigentes IMA [skip ci]"
+          file_pattern: |
+            data/convocatorias_vigentes.json
+            data/debug_page_*.html
+          commit_options: '--no-verify'
+          commit_user_name: ima-scraper[bot]
+          commit_user_email: actions@github.com
+          commit_author: IMA Scraper Bot <actions@github.com>
 
       # -----------------------------
-      # 7) (Opcional) subir JSON como artifact
+      # 9) Subir JSON como artifact
       # -----------------------------
       - name: Upload processed JSON
         uses: actions/upload-artifact@v4
         with:
-          name: ima-8uit-scraper-json
+          name: ima-8uit-convocatorias-${{ github.run_number }}
           path: data/convocatorias_vigentes.json
+          retention-days: 30
+
+      # -----------------------------
+      # 10) Notificación de resultados (opcional)
+      # -----------------------------
+      - name: Generate summary
+        run: |
+          echo "## 🎯 Scraper IMA - Resumen de Ejecución" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "data/convocatorias_vigentes.json" ]; then
+            TOTAL=$(python -c "
+import json
+with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(data['metadata']['total_convocatorias_vigentes'])
+            ")
+            
+            TIMESTAMP=$(python -c "
+import json
+with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+print(data['metadata']['scraped_at_utc'])
+            ")
+            
+            echo "✅ **Scraping exitoso**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- 📊 Total convocatorias vigentes: **$TOTAL**" >> $GITHUB_STEP_SUMMARY
+            echo "- ⏰ Timestamp: \`$TIMESTAMP\`" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔧 Triggered by: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$TOTAL" -gt 0 ]; then
+              echo "### 📋 Convocatorias Activas" >> $GITHUB_STEP_SUMMARY
+              python -c "
+import json
+with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+for conv in data['convocatorias'][:5]:  # Primeras 5
+    print(f\"- **{conv['numero']}**: {conv['descripcion'][:60]}...\")
+              " >> $GITHUB_STEP_SUMMARY
+              
+              if [ "$TOTAL" -gt 5 ]; then
+                echo "- _(y $(($TOTAL - 5)) más...)_" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          else
+            echo "❌ **Error en scraping**" >> $GITHUB_STEP_SUMMARY
+            echo "No se pudo generar el archivo JSON de resultados." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Job adicional para notificar a n8n (opcional)
+  notify:
+    runs-on: ubuntu-latest
+    needs: scrape
+    if: always() && github.event_name == 'repository_dispatch'
+    steps:
+      - name: Notify completion to n8n
+        run: |
+          echo "🔔 Notificando completión a sistema externo..."
+          # Aquí se puede agregar webhook de vuelta a n8n si es necesario
+          # curl -X POST $WEBHOOK_URL -H "Content-Type: application/json" \
+          #   -d '{"status": "${{ needs.scrape.result }}", "run_id": "${{ github.run_id }}"}'
