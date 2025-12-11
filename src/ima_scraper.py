@@ -1,38 +1,63 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Scraper de convocatorias vigentes de:
-https://www.ima.org.pe/adquisiciones-bienes-servicios-v2/s---1.html
+IMA 8UIT Scraper
 
-Salida: data/convocatorias_vigentes.json
+Objetivo:
+- Recorrer las páginas:
+    https://www.ima.org.pe/adquisiciones-bienes-servicios-v2/s---1.html
+    https://www.ima.org.pe/adquisiciones-bienes-servicios-v2/s---2.html
+    ...
+  hasta que ya no existan convocatorias.
+
+- De cada convocatoria:
+    · numero_convocatoria (ej. 'SOLICITUD DE COTIZACION N° 4017-2025')
+    · numero (ej. '4017-2025')
+    · descripcion
+    · publicado_el (dd/mm/yyyy)
+    · tipo (BIENES / SERVICIO)
+    · fecha_limite (dd/mm/yyyy)
+    · hora_limite (hh:mm AM/PM)
+    · estado (VIGENTE / VENCIDO, etc.) – solo se guardan VIGENTE
+    · pagina_origen (número de página IMA)
+    · tdr_url (URL PDF)
+    · tdr_filename
+    · tdr_downloaded (bool)
+    · caracteristicas_tecnicas (bloque extraído)
+    · caracteristicas_tecnicas_ocr (True si se usó OCR)
+
+- Generar un único JSON:
+    data/convocatorias_vigentes.json
 """
 
 # ============================================================
-# BLOQUE 1: Imports y constantes
+# BLOQUE 1: Imports, constantes y logging
 # ============================================================
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
-from requests import Response
+from PIL import Image
+import pytesseract
+from PyPDF2 import PdfReader
+from pdf2image import convert_from_path
 from urllib.parse import urljoin
 
 BASE_URL = "https://www.ima.org.pe/adquisiciones-bienes-servicios-v2"
 START_PAGE = 1
-MAX_PAGES = 30  # límite de seguridad, por si cambian el paginado
+MAX_PAGES = 30  # límite de seguridad
 
-OUTPUT_PATH = (
-    Path(__file__).resolve().parent.parent / "data" / "convocatorias_vigentes.json"
-)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+OUTPUT_JSON = ROOT_DIR / "data" / "convocatorias_vigentes.json"
+PDF_DIR = ROOT_DIR / "data" / "pdfs_ima"
 
-# Configuración básica de logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -40,87 +65,225 @@ logging.basicConfig(
 
 
 # ============================================================
-# BLOQUE 2: Funciones auxiliares de red y parsing
+# BLOQUE 2: Utilidades PDF / OCR
 # ============================================================
 
-def build_page_url(page: int) -> str:
+def _extract_caracteristicas_block(full_text: str) -> Optional[str]:
     """
-    Construye la URL de página:
-    s---1.html, s---2.html, etc., siempre colgando de BASE_URL.
+    Busca el bloque 'CARACTERISTICAS TECNICAS' dentro del texto completo
+    (texto extraído del PDF, ya sea embebido u OCR).
     """
-    return f"{BASE_URL}/s---{page}.html"
-
-
-def get_html(session: requests.Session, url: str) -> Optional[str]:
-    """
-    Descarga HTML y maneja errores básicos.
-    Devuelve el texto HTML o None si es 404 u otro error crítico.
-    """
-    try:
-        logging.info(f"Descargando: {url}")
-        resp: Response = session.get(url, timeout=30)
-        if resp.status_code == 404:
-            logging.warning(f"Página no encontrada (404): {url}")
-            return None
-        resp.raise_for_status()
-        # Asegurar codificación correcta
-        resp.encoding = resp.apparent_encoding
-        return resp.text
-    except requests.RequestException as exc:
-        logging.error(f"Error al descargar {url}: {exc}")
+    if not full_text:
         return None
 
+    normalized = full_text.upper()
 
-def find_convocatorias_table(soup: BeautifulSoup):
-    """
-    Ubica la tabla que contiene:
-    DESCRIPCION | TIPO | PLAZO | DESCARGAR
-    """
-    for table in soup.find_all("table"):
-        text = table.get_text(" ", strip=True).upper()
-        if "DESCRIPCION" in text and "PLAZO" in text:
-            return table
-    return None
+    patterns = [
+        "CARACTERISTICAS TECNICAS",
+        "CARACTERÍSTICAS TÉCNICAS",
+        "CARACTERISTICAS TÉCNICAS",
+        "CARACTERÍSTICAS TECNICAS",
+    ]
+
+    start_idx = -1
+    chosen = ""
+    for p in patterns:
+        pos = normalized.find(p)
+        if pos != -1:
+            start_idx = pos
+            chosen = p
+            break
+
+    if start_idx == -1:
+        return None
+
+    # Posibles encabezados que marcan el final del bloque
+    end_markers = [
+        "CONDICIONES GENERALES",
+        "CONDICIONES CONTRACTUALES",
+        "CONDICIONES",
+        "REQUISITOS",
+        "OBLIGACIONES",
+        "PLAZO DE ENTREGA",
+        "PLAZO DE EJECUCION",
+        "PLAZO DE EJECUCIÓN",
+        "GARANTIAS",
+        "GARANTÍAS",
+        "FORMA DE PAGO",
+    ]
+
+    end_idx = len(full_text)
+    for m in end_markers:
+        pos = normalized.find(m, start_idx + len(chosen))
+        if pos != -1 and pos > start_idx:
+            end_idx = min(end_idx, pos)
+
+    segment = full_text[start_idx:end_idx].strip()
+
+    # Cortamos muy largos para evitar JSON monstruoso
+    max_len = 4000
+    if len(segment) > max_len:
+        segment = segment[:max_len] + "\n[...]"
+
+    return segment
 
 
-def parse_fecha_hora_estado(plazo_text: str):
+def extract_caracteristicas_from_pdf(
+    pdf_path: str,
+    enable_ocr_fallback: bool = True,
+) -> Tuple[Optional[str], bool]:
     """
-    Ejemplo de texto en la columna PLAZO:
-    '14/11/2024 10:30 AM (VENCIDO)'
-    '12/12/2025 4:30 PM (VIGENTE)'
+    Intenta extraer 'CARACTERISTICAS TECNICAS' de un PDF.
+
+    Intento 1: texto embebido (PyPDF2).
+    Intento 2 (fallback, si enable_ocr_fallback=True): OCR de imágenes
+        (pdf2image + pytesseract).
+
+    Devuelve:
+      (bloque_texto_o_None, used_ocr)
     """
-    plazo_clean = " ".join(plazo_text.split())
-    # Estado entre paréntesis
+    text_pages: List[str] = []
+    used_ocr: bool = False
+
+    # ---------- Intento 1: Texto embebido ----------
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        logging.warning(f"No se pudo abrir PDF '{pdf_path}': {e}")
+        return None, False
+
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            text_pages.append(t)
+
+    if text_pages:
+        full_text = "\n".join(text_pages)
+        block = _extract_caracteristicas_block(full_text)
+        if block:
+            logging.info(
+                "Bloque 'CARACTERISTICAS TECNICAS' obtenido desde texto embebido: %s",
+                pdf_path,
+            )
+            return block, False
+
+    # ---------- Intento 2: OCR ----------
+    if not enable_ocr_fallback:
+        return None, False
+
+    try:
+        images = convert_from_path(pdf_path, dpi=300)
+    except Exception as e:
+        logging.warning(
+            "Fallback OCR: no se pudo rasterizar '%s' a imágenes: %s", pdf_path, e
+        )
+        return None, False
+
+    used_ocr = True
+    ocr_texts: List[str] = []
+
+    for idx, img in enumerate(images):
+        try:
+            gray = img.convert("L")
+            txt = pytesseract.image_to_string(gray)
+            if txt.strip():
+                ocr_texts.append(txt)
+        except Exception as e:
+            logging.warning("Error OCR en página %s de '%s': %s", idx, pdf_path, e)
+
+    if not ocr_texts:
+        logging.warning("Fallback OCR: no se obtuvo texto para '%s'", pdf_path)
+        return None, used_ocr
+
+    full_ocr_text = "\n".join(ocr_texts)
+    block_ocr = _extract_caracteristicas_block(full_ocr_text)
+    if block_ocr:
+        logging.info(
+            "Bloque 'CARACTERISTICAS TECNICAS' obtenido por OCR: %s", pdf_path
+        )
+    else:
+        logging.info(
+            "Fallback OCR: sin bloque 'CARACTERISTICAS TECNICAS' en '%s'", pdf_path
+        )
+
+    return block_ocr, used_ocr
+
+
+def download_pdf(session: requests.Session, url: str, dest_dir: Path) -> Optional[Path]:
+    """
+    Descarga un PDF y lo guarda en dest_dir.
+    Devuelve la ruta local o None si falla.
+    """
+    try:
+        resp = session.get(url, timeout=60)
+        if resp.status_code == 404:
+            logging.warning("PDF 404: %s", url)
+            return None
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logging.warning("Error descargando PDF %s: %s", url, exc)
+        return None
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    filename = url.split("/")[-1] or "tdr_ima.pdf"
+    path = dest_dir / filename
+
+    try:
+        with path.open("wb") as f:
+            f.write(resp.content)
+    except Exception as exc:
+        logging.warning("Error guardando PDF '%s': %s", path, exc)
+        return None
+
+    return path
+
+
+# ============================================================
+# BLOQUE 3: Utilidades de parsing de HTML
+# ============================================================
+
+def parse_fecha_hora_estado(text: str) -> Tuple[str, str, str]:
+    """
+    A partir del texto completo del "card" de la convocatoria
+    extrae:
+      - fecha_limite (dd/mm/yyyy)
+      - hora_limite (hh:mm AM/PM)
+      - estado (entre paréntesis, ej. VIGENTE / VENCIDO)
+    """
+    plazo_clean = " ".join(text.split())
+
     m_estado = re.search(r"\(([^()]*)\)\s*$", plazo_clean)
     estado = m_estado.group(1).strip().upper() if m_estado else ""
 
-    # Fecha dd/mm/yyyy
     m_fecha = re.search(r"(\d{2}/\d{2}/\d{4})", plazo_clean)
     fecha = m_fecha.group(1) if m_fecha else ""
 
-    # Hora hh:mm AM/PM
-    m_hora = re.search(r"(\d{1,2}:\d{2}\s*[AP]M)", plazo_clean, flags=re.IGNORECASE)
+    m_hora = re.search(
+        r"(\d{1,2}:\d{2}\s*[AP]M)", plazo_clean, flags=re.IGNORECASE
+    )
     hora = m_hora.group(1).upper() if m_hora else ""
 
     return fecha, hora, estado
 
 
-def parse_descripcion_block(desc_text: str):
+def parse_descripcion_block(desc_text: str) -> Tuple[str, str, str]:
     """
-    desc_text típico (todo en una sola cadena):
+    A partir del texto de la "card" que contiene:
 
-    'SOLICITUD DE COTIZACION N° 3983-2025
-     SERVICIO DE ACONDICIONAMIENTO DE COBERTURAS
-     | Publicado el 28/11/2025 |'
+      'SOLICITUD DE COTIZACION N° 4017-2025
+       SERVICIO DE ...
+       | Publicado el 10/12/2025 | ...'
 
-    Se extrae:
-      - numero
-      - descripcion
-      - publicado_el
+    Devuelve:
+      - numero -> '4017-2025'
+      - descripcion -> 'SERVICIO DE ...'
+      - publicado_el -> '10/12/2025'
     """
-    # Normalizar espacios
     txt = " ".join(desc_text.split())
-    # Número de solicitud
+
     m_num = re.search(
         r"SOLICITUD\s+DE\s+COTIZACION\s*N[°º]\s*([0-9\-]+)",
         txt,
@@ -128,7 +291,6 @@ def parse_descripcion_block(desc_text: str):
     )
     numero = m_num.group(1).strip() if m_num else ""
 
-    # Fecha de publicación
     m_pub = re.search(
         r"PUBLICADO\s+EL\s+([0-9]{2}/[0-9]{2}/[0-9]{4})",
         txt,
@@ -136,77 +298,154 @@ def parse_descripcion_block(desc_text: str):
     )
     publicado_el = m_pub.group(1) if m_pub else ""
 
-    # Para descripción, quitamos el prefijo de la solicitud y el bloque de publicación
     desc_region = txt
     if m_num:
         desc_region = desc_region[m_num.end():].strip()
     if m_pub:
         desc_region = desc_region[:m_pub.start()].strip()
 
-    # Eliminar barras verticales si las hubiera
     desc_region = desc_region.replace("|", " ").strip()
-
     descripcion = " ".join(desc_region.split())
+
     return numero, descripcion, publicado_el
 
 
-def parse_row(tr, page: int) -> Optional[Dict]:
-    """
-    Parsea una fila de la tabla de convocatorias.
-    Devuelve un dict SOLO si el estado es VIGENTE.
-    """
-    cells = tr.find_all("td")
-    if len(cells) < 3:
+def build_page_url(page: int) -> str:
+    return f"{BASE_URL}/s---{page}.html"
+
+
+def get_html(session: requests.Session, url: str) -> Optional[str]:
+    try:
+        logging.info("Descargando página: %s", url)
+        resp = session.get(url, timeout=30)
+        if resp.status_code == 404:
+            logging.info("Página 404: %s", url)
+            return None
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+        return resp.text
+    except requests.RequestException as exc:
+        logging.error("Error al descargar %s: %s", url, exc)
         return None
 
-    # Columna DESCRIPCION (contiene "SOLICITUD DE COTIZACION N° ...", descripción, publicado)
-    desc_text = " ".join(cells[0].stripped_strings)
-    numero, descripcion, publicado_el = parse_descripcion_block(desc_text)
 
-    # Columna TIPO (BIENES / SERVICIO)
-    tipo_text = " ".join(cells[1].stripped_strings)
-    tipo = tipo_text.strip().upper()
+def parse_page_convocatorias(
+    session: requests.Session,
+    html: str,
+    page_number: int,
+) -> List[Dict]:
+    """
+    Parsea una página HTML del IMA y devuelve las convocatorias VIGENTES
+    ya enriquecidas con información del PDF (si existe).
+    """
+    soup = BeautifulSoup(html, "html.parser")
 
-    # Columna PLAZO (fecha límite, hora, estado)
-    plazo_text = " ".join(cells[2].stripped_strings)
-    fecha_limite, hora_limite, estado = parse_fecha_hora_estado(plazo_text)
+    # Buscar nodos que contengan "SOLICITUD DE COTIZACION N°"
+    pattern = re.compile(r"SOLICITUD\s+DE\s+COTIZACION\s*N[°º]\s*\d", re.IGNORECASE)
+    text_nodes = soup.find_all(string=pattern)
 
-    # Solo nos interesan las convocatorias VIGENTES
-    if estado != "VIGENTE":
-        return None
+    results: List[Dict] = []
+    seen_containers = set()
 
-    # Columna DESCARGAR (si existe)
-    url_descarga = None
-    if len(cells) >= 4:
-        link = cells[3].find("a", href=True)
-        if link:
-            url_descarga = urljoin(BASE_URL + "/", link["href"])
+    for node in text_nodes:
+        container = node.parent
 
-    return {
-        "numero": numero,
-        "descripcion": descripcion,
-        "publicado_el": publicado_el,      # dd/mm/yyyy
-        "tipo": tipo,                      # BIENES / SERVICIO
-        "fecha_limite": fecha_limite,      # dd/mm/yyyy
-        "hora_limite": hora_limite,        # hh:mm AM/PM
-        "estado": estado,                  # siempre 'VIGENTE' aquí
-        "url_descarga": url_descarga,
-        "pagina_origen": page,
-    }
+        # Subimos algunos niveles hasta encontrar un contenedor razonable
+        # que tenga "Publicado el" y (idealmente) el link al PDF.
+        for _ in range(6):
+            if container is None:
+                break
+            text = container.get_text(" ", strip=True)
+            if "Publicado el" in text:
+                break
+            container = container.parent
+
+        if container is None:
+            continue
+
+        # Evitar usar el mismo contenedor varias veces
+        key = id(container)
+        if key in seen_containers:
+            continue
+        seen_containers.add(key)
+
+        full_text = container.get_text(" ", strip=True)
+        numero, descripcion, publicado_el = parse_descripcion_block(full_text)
+        fecha_limite, hora_limite, estado = parse_fecha_hora_estado(full_text)
+
+        # Solo convocatorias VIGENTES
+        if estado != "VIGENTE":
+            continue
+
+        m_tipo = re.search(r"\b(BIENES|SERVICIO)\b", full_text, flags=re.IGNORECASE)
+        tipo = m_tipo.group(1).upper() if m_tipo else ""
+
+        # Link al PDF dentro del contenedor
+        pdf_url = None
+        link = container.find("a", href=re.compile(r"\.pdf\b", re.IGNORECASE))
+        if link and link.get("href"):
+            pdf_url = urljoin(BASE_URL + "/", link["href"])
+
+        item: Dict[str, Optional[str]] = {
+            "numero_convocatoria": (
+                f"SOLICITUD DE COTIZACION N° {numero}" if numero else ""
+            ),
+            "numero": numero,
+            "descripcion": descripcion,
+            "publicado_el": publicado_el,
+            "tipo": tipo,
+            "fecha_limite": fecha_limite,
+            "hora_limite": hora_limite,
+            "estado": estado,
+            "pagina_origen": page_number,
+            "tdr_url": pdf_url,
+            "tdr_filename": None,
+            "tdr_downloaded": False,
+            "caracteristicas_tecnicas": None,
+            "caracteristicas_tecnicas_ocr": False,
+        }
+
+        # Descargar PDF y extraer CARACTERISTICAS TECNICAS
+        if pdf_url:
+            pdf_path = download_pdf(session, pdf_url, PDF_DIR)
+            if pdf_path:
+                item["tdr_filename"] = pdf_path.name
+                item["tdr_downloaded"] = True
+                block, used_ocr = extract_caracteristicas_from_pdf(str(pdf_path), True)
+                item["caracteristicas_tecnicas"] = block
+                item["caracteristicas_tecnicas_ocr"] = bool(used_ocr)
+
+        results.append(item)
+
+    logging.info(
+        "Página %s: convocatorias VIGENTES encontradas: %s",
+        page_number,
+        len(results),
+    )
+    return results
 
 
 # ============================================================
-# BLOQUE 3: Scraping multi-página y ordenado
+# BLOQUE 4: Scraping multi-página, orden y guardado JSON
 # ============================================================
+
+def sort_convocatorias(convocatorias: List[Dict]) -> List[Dict]:
+    """
+    Ordena las convocatorias por fecha_limite + hora_limite (más próximas primero).
+    """
+    def sort_key(item: Dict):
+        fecha = item.get("fecha_limite") or ""
+        hora = item.get("hora_limite") or "00:00 AM"
+        try:
+            dt = datetime.strptime(f"{fecha} {hora}", "%d/%m/%Y %I:%M %p")
+        except ValueError:
+            dt = datetime.min
+        return dt
+
+    return sorted(convocatorias, key=sort_key)
+
 
 def scrape_convocatorias_vigentes() -> List[Dict]:
-    """
-    Recorre las páginas s---1.html, s---2.html, ... hasta:
-      - encontrar 404, o
-      - no hallar tabla de convocatorias
-
-    Devuelve lista de dicts SOLO con convocatorias VIGENTES.
-    """
     session = requests.Session()
     session.headers.update(
         {
@@ -218,63 +457,31 @@ def scrape_convocatorias_vigentes() -> List[Dict]:
         }
     )
 
-    resultados: List[Dict] = []
+    all_items: List[Dict] = []
 
     for page in range(START_PAGE, START_PAGE + MAX_PAGES):
         url = build_page_url(page)
         html = get_html(session, url)
         if html is None:
-            # Probablemente 404 o error de red crítico
-            logging.info(f"Fin del paginado en página {page}.")
+            # 404 o error grave → asumimos fin
             break
 
-        soup = BeautifulSoup(html, "html.parser")
-        table = find_convocatorias_table(soup)
-        if not table:
-            logging.info(f"Sin tabla de convocatorias en página {page}. Deteniendo.")
+        page_items = parse_page_convocatorias(session, html, page)
+        if not page_items and page > START_PAGE:
+            # Página sin convocatorias después de haber encontrado en anteriores → fin
             break
 
-        filas = table.find_all("tr")
-        if len(filas) <= 1:
-            logging.info(f"Tabla sin filas de datos en página {page}. Deteniendo.")
-            break
+        all_items.extend(page_items)
 
-        logging.info(f"Procesando página {page} con {len(filas) - 1} filas de datos.")
-        for tr in filas[1:]:
-            item = parse_row(tr, page)
-            if item:
-                resultados.append(item)
+    return sort_convocatorias(all_items)
 
-    # Ordenar por fecha_limite + hora_limite (más próximas primero)
-    def sort_key(item: Dict):
-        fecha = item.get("fecha_limite") or ""
-        hora = item.get("hora_limite") or "00:00 AM"
-        try:
-            dt = datetime.strptime(f"{fecha} {hora}", "%d/%m/%Y %I:%M %p")
-        except ValueError:
-            dt = datetime.min
-        return dt
-
-    resultados.sort(key=sort_key)
-    return resultados
-
-
-# ============================================================
-# BLOQUE 4: Escritura de JSON y punto de entrada
-# ============================================================
 
 def save_to_json(convocatorias: List[Dict], path: Path) -> None:
-    """
-    Escribe un único archivo JSON con:
-      - metadata
-      - lista de convocatorias vigentes
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
         "metadata": {
-            "source": str(build_page_url(START_PAGE)),
-            "base_url": BASE_URL,
+            "source": BASE_URL,
             "scraped_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "total_convocatorias_vigentes": len(convocatorias),
         },
@@ -284,14 +491,15 @@ def save_to_json(convocatorias: List[Dict], path: Path) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    logging.info(f"JSON generado: {path} ({len(convocatorias)} vigentes)")
+    logging.info("JSON generado: %s (total=%s)", path, len(convocatorias))
 
 
-def main():
+def main() -> None:
+    logging.info("Iniciando scraper IMA 8UIT...")
     convocatorias = scrape_convocatorias_vigentes()
-    save_to_json(convocatorias, OUTPUT_PATH)
+    save_to_json(convocatorias, OUTPUT_JSON)
+    logging.info("Scraper IMA 8UIT finalizado.")
 
 
 if __name__ == "__main__":
     main()
-
