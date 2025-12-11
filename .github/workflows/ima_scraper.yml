@@ -1,34 +1,80 @@
-name: Scraper IMA 8UIT
+name: IMA 8UIT Scraper
 
 on:
-  workflow_dispatch:    # ejecución manual
+  workflow_dispatch:        # ejecución manual
   schedule:
-    - cron: "0 11 * * *"   # todos los días 11:00 UTC (~06:00 Lima/Colombia)
+    - cron: "0 11 * * *"    # todos los días 11:00 UTC (~06:00 Lima/Bogotá)
 
 jobs:
-  run-scraper:
+  scrape:
     runs-on: ubuntu-latest
 
+    # Permite que github-actions[bot] haga git push
+    permissions:
+      contents: write
+
     steps:
+      # -----------------------------
+      # 1) Checkout del repositorio
+      # -----------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # -----------------------------
+      # 2) Instalar dependencias de sistema
+      #    (Tesseract para OCR + Poppler para pdf2image)
+      # -----------------------------
+      - name: Install system dependencies (Tesseract, Poppler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            tesseract-ocr \
+            poppler-utils
+
+      # -----------------------------
+      # 3) Setup de Python
+      # -----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      # -----------------------------
+      # 4) Instalar dependencias Python
+      #    (no usamos Playwright aquí)
+      # -----------------------------
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install \
+            requests \
+            beautifulsoup4 \
+            pillow \
+            pytesseract \
+            PyPDF2 \
+            pdf2image
 
-      - name: Run scraper
+      # -----------------------------
+      # 5) Ejecutar el scraper del IMA
+      # -----------------------------
+      - name: Run IMA 8UIT scraper
         run: |
           python src/ima_scraper.py
 
+      # -----------------------------
+      # 6) Commit + push del JSON
+      # -----------------------------
       - name: Commit JSON actualizado
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: actualizar convocatorias vigentes IMA"
           file_pattern: data/convocatorias_vigentes.json
+
+      # -----------------------------
+      # 7) (Opcional) Subir JSON como artifact
+      # -----------------------------
+      - name: Upload processed JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: ima-8uit-scraper-json
+          path: data/convocatorias_vigentes.json
