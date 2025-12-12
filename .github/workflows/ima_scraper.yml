@@ -101,13 +101,7 @@ jobs:
           if [ -f "data/convocatorias_vigentes.json" ]; then
             echo "✅ Scraping completado exitosamente"
             echo "📊 Estadísticas:"
-            python -c "
-import json
-with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
-    data = json.load(f)
-print(f\"  - Total convocatorias vigentes: {data['metadata']['total_convocatorias_vigentes']}\")
-print(f\"  - Scrapeado en: {data['metadata']['scraped_at_utc']}\")
-            "
+            python -c 'import json; f=open("data/convocatorias_vigentes.json","r",encoding="utf-8"); data=json.load(f); f.close(); print("  - Total convocatorias vigentes:", data["metadata"]["total_convocatorias_vigentes"]); print("  - Scrapeado en:", data["metadata"]["scraped_at_utc"])'
           else
             echo "❌ Error: No se generó el archivo JSON"
             exit 1
@@ -164,19 +158,23 @@ print(f\"  - Scrapeado en: {data['metadata']['scraped_at_utc']}\")
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ -f "data/convocatorias_vigentes.json" ]; then
-            TOTAL=$(python -c "
+            # Crear script temporal para evitar problemas de comillas
+            cat > /tmp/get_stats.py << 'EOF'
 import json
 with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
 print(data['metadata']['total_convocatorias_vigentes'])
-            ")
+EOF
             
-            TIMESTAMP=$(python -c "
+            cat > /tmp/get_timestamp.py << 'EOF'
 import json
 with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
 print(data['metadata']['scraped_at_utc'])
-            ")
+EOF
+            
+            TOTAL=$(python /tmp/get_stats.py)
+            TIMESTAMP=$(python /tmp/get_timestamp.py)
             
             echo "✅ **Scraping exitoso**" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -187,18 +185,28 @@ print(data['metadata']['scraped_at_utc'])
             
             if [ "$TOTAL" -gt 0 ]; then
               echo "### 📋 Convocatorias Activas" >> $GITHUB_STEP_SUMMARY
-              python -c "
+              
+              # Script para mostrar primeras 5 convocatorias
+              cat > /tmp/show_convocatorias.py << 'EOF'
 import json
 with open('data/convocatorias_vigentes.json', 'r', encoding='utf-8') as f:
     data = json.load(f)
-for conv in data['convocatorias'][:5]:  # Primeras 5
-    print(f\"- **{conv['numero']}**: {conv['descripcion'][:60]}...\")
-              " >> $GITHUB_STEP_SUMMARY
+for conv in data['convocatorias'][:5]:
+    desc = conv.get('descripcion', '')[:60]
+    if len(conv.get('descripcion', '')) > 60:
+        desc += '...'
+    print(f"- **{conv.get('numero', '')}**: {desc}")
+EOF
+              
+              python /tmp/show_convocatorias.py >> $GITHUB_STEP_SUMMARY
               
               if [ "$TOTAL" -gt 5 ]; then
                 echo "- _(y $(($TOTAL - 5)) más...)_" >> $GITHUB_STEP_SUMMARY
               fi
             fi
+            
+            # Limpiar scripts temporales
+            rm -f /tmp/get_stats.py /tmp/get_timestamp.py /tmp/show_convocatorias.py
           else
             echo "❌ **Error en scraping**" >> $GITHUB_STEP_SUMMARY
             echo "No se pudo generar el archivo JSON de resultados." >> $GITHUB_STEP_SUMMARY
